@@ -1,0 +1,43 @@
+name: Publish build as release
+
+# Copies the Windows artifact of an existing "Build and Release KytyPS5" run into a
+# GitHub Release on this fork, so it can be downloaded from the Releases page.
+on:
+  workflow_dispatch:
+    inputs:
+      run_id:
+        description: "ID of the successful build run to publish"
+        required: true
+      tag:
+        description: "Release tag to create"
+        required: true
+
+permissions:
+  contents: write
+  actions: read
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download Windows artifact from the build run
+        uses: actions/download-artifact@v4
+        with:
+          name: KytyPS5-Windows-x64
+          run-id: ${{ inputs.run_id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: windows
+
+      - name: Package and create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -e
+          (cd windows && zip -qr "../${TAG}-Windows-x64.zip" .)
+          cp windows/kyty_emulator.exe "kyty_emulator.exe"
+          sha256sum "${TAG}-Windows-x64.zip" kyty_emulator.exe > SHA256SUMS.txt
+          gh release create "$TAG" "${TAG}-Windows-x64.zip" kyty_emulator.exe SHA256SUMS.txt \
+            --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            --title "$TAG" \
+            --notes "Windows build from run ${{ inputs.run_id }} (fork build, not an official KytyPS5 release)."
