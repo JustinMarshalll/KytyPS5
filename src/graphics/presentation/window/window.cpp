@@ -738,6 +738,11 @@ void WindowContext::Run() {
 	constexpr uint64_t title_interval_ms = 1000;
 	auto               title_time        = SDL_GetTicks();
 	auto               title_frames      = loop.presented_frames.load(std::memory_order_relaxed);
+	// Checkpoint the Vulkan pipeline cache during play. Without this it is only written on a
+	// clean exit, so a crash or forced close loses every pipeline built in the session and the
+	// next run stutters through the same compiles again.
+	constexpr uint64_t cache_checkpoint_interval_ms = 30000;
+	auto               cache_checkpoint_time        = SDL_GetTicks();
 
 	while (!loop.need_exit) {
 		if (loop.paused.load(std::memory_order_acquire)) {
@@ -759,6 +764,20 @@ void WindowContext::Run() {
 			}
 			title_time   = now;
 			title_frames = frames;
+		}
+		if (now - cache_checkpoint_time >= cache_checkpoint_interval_ms &&
+		    !loop.paused.load(std::memory_order_acquire)) {
+			cache_checkpoint_time = now;
+			PipelineCache::Snapshot snapshot;
+			bool                    have_snapshot = false;
+			{
+				// Only the in-memory copy happens under the renderer lock.
+				Common::LockGuard lock(render_context->GetMutex());
+				have_snapshot = render_context->GetPipelineCache().TakeSnapshot(snapshot);
+			}
+			if (have_snapshot) {
+				PipelineCache::WriteSnapshot(snapshot);
+			}
 		}
 		const auto wait_ms = static_cast<int>(title_interval_ms - (now - title_time));
 		if (!HostInputWaitEvent(&loop.event, wait_ms)) {

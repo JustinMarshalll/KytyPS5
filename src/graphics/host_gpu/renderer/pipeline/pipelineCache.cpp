@@ -103,6 +103,68 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// Reads the driver cache contents. Returns false (and leaves result/size describing the
+// failure) if the data could not be read.
+bool ReadDriverCacheData(vk::Device device, vk::PipelineCache cache, std::vector<uint8_t>& payload,
+                         vk::Result& result, size_t& size) {
+	payload.clear();
+	for (uint32_t attempt = 0; attempt < 3; attempt++) {
+		size   = 0;
+		result = device.getPipelineCacheData(cache, &size, nullptr);
+		if (result != vk::Result::eSuccess || size == 0 ||
+		    size > std::numeric_limits<uint32_t>::max()) {
+			break;
+		}
+		payload.resize(size);
+		result = device.getPipelineCacheData(cache, &size, payload.data());
+		if (result != vk::Result::eIncomplete) {
+			break;
+		}
+	}
+	if (result != vk::Result::eSuccess || size == 0 ||
+	    size > std::numeric_limits<uint32_t>::max()) {
+		payload.clear();
+		return false;
+	}
+	payload.resize(size);
+	return true;
+}
+
+std::string DriverCachePrefix(const vk::PhysicalDeviceProperties& properties,
+                              const std::vector<uint8_t>&         payload) {
+	auto       prefix       = DriverCacheSignature(properties);
+	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
+	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
+	return prefix;
+}
+
+// Writes prefix + payload to a temporary file and renames it over path, so a crash during the
+// write never leaves a truncated cache behind.
+bool WriteDriverCacheFile(const std::filesystem::path& path, const std::string& prefix,
+                          const std::vector<uint8_t>& payload) {
+	if (!Common::File::CreateDirectories(path.parent_path())) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
+		return false;
+	}
+	auto temp_path = path;
+	temp_path += ".tmp";
+	Common::File file;
+	uint32_t     prefix_written  = 0;
+	uint32_t     payload_written = 0;
+	if (file.Create(temp_path)) {
+		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
+		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
+	}
+	const bool flushed = !file.IsInvalid() && file.Flush();
+	file.Close();
+	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
+	    !Common::File::RenameFile(temp_path, path)) {
+		PipelineCacheLog("Vulkan pipeline cache: failed to write {}", Common::PathToString(path));
+		return false;
+	}
+	return true;
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
@@ -593,56 +655,46 @@ void PipelineCache::Save() {
 	}
 
 	size_t               size = 0;
-	vk::Result           result;
+	vk::Result           result {};
 	std::vector<uint8_t> payload;
-	for (uint32_t attempt = 0; attempt < 3; attempt++) {
-		size   = 0;
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, nullptr);
-		if (result != vk::Result::eSuccess || size == 0 ||
-		    size > std::numeric_limits<uint32_t>::max()) {
-			break;
-		}
-		payload.resize(size);
-		result = m_graphics.device.getPipelineCacheData(m_driver_cache, &size, payload.data());
-		if (result != vk::Result::eIncomplete) {
-			break;
-		}
-	}
-	if (result != vk::Result::eSuccess || size == 0 ||
-	    size > std::numeric_limits<uint32_t>::max()) {
+	if (!ReadDriverCacheData(m_graphics.device, m_driver_cache, payload, result, size)) {
 		PipelineCacheLog("Vulkan pipeline cache: save failed ({}, {} bytes)",
 		                 vk::to_string(result), size);
 		return;
 	}
-	payload.resize(size);
-	auto       prefix       = DriverCacheSignature(m_graphics.GetPhysicalDeviceProperties());
-	const auto payload_hash = XXH3_64bits(payload.data(), payload.size());
-	prefix.append(reinterpret_cast<const char*>(&payload_hash), sizeof(payload_hash));
-	if (!Common::File::CreateDirectories(m_driver_cache_path.parent_path())) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to create cache directory");
-		return;
-	}
-	auto temp_path = m_driver_cache_path;
-	temp_path += ".tmp";
-	Common::File file;
-	uint32_t     prefix_written  = 0;
-	uint32_t     payload_written = 0;
-	if (file.Create(temp_path)) {
-		file.Write(prefix.data(), static_cast<uint32_t>(prefix.size()), &prefix_written);
-		file.Write(payload.data(), static_cast<uint32_t>(payload.size()), &payload_written);
-	}
-	const bool flushed = !file.IsInvalid() && file.Flush();
-	file.Close();
-	if (prefix_written != prefix.size() || payload_written != payload.size() || !flushed ||
-	    !Common::File::RenameFile(temp_path, m_driver_cache_path)) {
-		PipelineCacheLog("Vulkan pipeline cache: failed to write {}",
-		                 Common::PathToString(m_driver_cache_path));
+	const auto prefix = DriverCachePrefix(m_graphics.GetPhysicalDeviceProperties(), payload);
+	if (!WriteDriverCacheFile(m_driver_cache_path, prefix, payload)) {
 		return;
 	}
 	PipelineCacheLog("Vulkan pipeline cache: saved {} bytes to {}", payload.size(),
 	                 Common::PathToString(m_driver_cache_path));
 	m_graphics.device.destroyPipelineCache(m_driver_cache, nullptr);
 	m_driver_cache = nullptr;
+}
+
+bool PipelineCache::TakeSnapshot(Snapshot& out) {
+	if (m_driver_cache == nullptr || m_pipelines_since_snapshot == 0) {
+		return false;
+	}
+	size_t     size = 0;
+	vk::Result result {};
+	if (!ReadDriverCacheData(m_graphics.device, m_driver_cache, out.payload, result, size)) {
+		return false;
+	}
+	out.prefix = DriverCachePrefix(m_graphics.GetPhysicalDeviceProperties(), out.payload);
+	out.path   = m_driver_cache_path;
+	m_pipelines_since_snapshot = 0;
+	return true;
+}
+
+void PipelineCache::WriteSnapshot(const Snapshot& snapshot) {
+	if (snapshot.path.empty() || snapshot.payload.empty()) {
+		return;
+	}
+	if (WriteDriverCacheFile(snapshot.path, snapshot.prefix, snapshot.payload)) {
+		PipelineCacheLog("Vulkan pipeline cache: checkpoint saved {} bytes to {}",
+		                 snapshot.payload.size(), Common::PathToString(snapshot.path));
+	}
 }
 
 PipelineCache::GraphicsPrograms PipelineCache::GetGraphicsPrograms(
@@ -956,6 +1008,7 @@ PipelineCache::Pipeline& PipelineCache::GetGraphicsPipeline(
 
 	auto [iter, inserted] = m_graphics_pipelines.emplace(std::move(key), std::move(cached));
 	EXIT_IF(!inserted);
+	m_pipelines_since_snapshot++;
 
 	return *iter->second;
 }
@@ -984,6 +1037,7 @@ PipelineCache::GetComputePipeline(const ShaderComputeInputInfo& input_info,
 
 	auto [iter, inserted] = m_compute_pipelines.emplace(compute_program.id, std::move(cached));
 	EXIT_IF(!inserted);
+	m_pipelines_since_snapshot++;
 
 	return *iter->second;
 }

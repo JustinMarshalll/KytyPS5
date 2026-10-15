@@ -12,8 +12,10 @@
 #include <filesystem>
 #include <memory>
 #include <span>
+#include <string>
 #include <type_traits>
 #include <unordered_map>
+#include <vector>
 
 namespace Libs::Graphics {
 
@@ -107,6 +109,18 @@ public:
 	KYTY_CLASS_NO_COPY(PipelineCache);
 	void Save();
 
+	// Periodic save while the game runs, so a crash or forced close does not lose the
+	// pipelines built during the session. TakeSnapshot() must be called with the renderer
+	// mutex held (it reads the driver cache); WriteSnapshot() does the file I/O and must be
+	// called without the mutex so rendering is not blocked by disk writes.
+	struct Snapshot {
+		std::vector<uint8_t> payload;
+		std::string          prefix;
+		std::filesystem::path path;
+	};
+	[[nodiscard]] bool TakeSnapshot(Snapshot& out);
+	static void        WriteSnapshot(const Snapshot& snapshot);
+
 	struct Pipeline {
 		vk::PipelineLayout      pipeline_layout       = nullptr;
 		vk::Pipeline            pipeline              = nullptr;
@@ -173,6 +187,7 @@ private:
 	std::unique_ptr<ProgramCache> m_program_cache;
 	vk::PipelineCache             m_driver_cache = nullptr;
 	std::filesystem::path         m_driver_cache_path;
+	uint64_t                      m_pipelines_since_snapshot = 0;
 	std::unordered_map<GraphicsPipelineKey, std::unique_ptr<Pipeline>, GraphicsPipelineKeyHash>
 	                                                        m_graphics_pipelines;
 	std::unordered_map<uint64_t, std::unique_ptr<Pipeline>> m_compute_pipelines;
